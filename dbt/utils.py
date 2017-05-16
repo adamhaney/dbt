@@ -28,6 +28,13 @@ class NodeType(object):
     Test = 'test'
     Archive = 'archive'
     Macro = 'macro'
+    Operation = 'operation'
+
+
+class RunHookType:
+    Start = 'on-run-start'
+    End = 'on-run-end'
+    Both = [Start, End]
 
 
 class This(object):
@@ -75,7 +82,7 @@ def compiler_warning(model, msg):
 class Var(object):
     UndefinedVarError = "Required var '{}' not found in config:\nVars "\
                         "supplied to {} = {}"
-    NoneVarError = "Supplied var '{}' is undefined in config:\nVars supplied"\
+    NoneVarError = "Supplied var '{}' is undefined in config:\nVars supplied "\
                    "to {} = {}"
 
     def __init__(self, model, context):
@@ -105,10 +112,11 @@ class Var(object):
         elif var_name in self.local_vars:
             raw = self.local_vars[var_name]
             if raw is None:
+                model_name = get_model_name_or_none(self.model)
                 compiler_error(
                     self.model,
                     self.NoneVarError.format(
-                        var_name, self.model.nice_name, pretty_vars
+                        var_name, model_name, pretty_vars
                     )
                 )
 
@@ -261,3 +269,33 @@ def get_pseudo_test_path(node_name, source_path, test_type):
     suffix = [test_type, "{}.sql".format(node_name)]
     pseudo_path_parts = source_path_parts + suffix
     return os.path.join(*pseudo_path_parts)
+
+
+def get_pseudo_hook_path(hook_name):
+    path_parts = ['hooks', "{}.sql".format(hook_name)]
+    return os.path.join(*path_parts)
+
+
+def get_run_status_line(results):
+    total = len(results)
+    errored = len([r for r in results if r.errored or r.failed])
+    skipped = len([r for r in results if r.skipped])
+    passed = total - errored - skipped
+
+    return (
+        "Done. PASS={passed} ERROR={errored} SKIP={skipped} TOTAL={total}"
+        .format(
+            total=total,
+            passed=passed,
+            errored=errored,
+            skipped=skipped
+        ))
+
+
+def get_nodes_by_tags(nodes, match_tags, resource_type):
+    matched_nodes = []
+    for node in nodes:
+        node_tags = node.get('tags', set())
+        if len(node_tags & match_tags):
+            matched_nodes.append(node)
+    return matched_nodes

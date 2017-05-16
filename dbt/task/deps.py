@@ -3,8 +3,10 @@ import errno
 import re
 
 import dbt.clients.git
+import dbt.clients.system
 import dbt.project as project
 
+from dbt.compat import basestring
 from dbt.logger import GLOBAL_LOGGER as logger
 
 
@@ -46,12 +48,12 @@ class DepsTask:
         if exists:
             if start_sha == end_sha:
                 logger.info('  Already at {}, nothing to do.'.format(
-                    start_sha[:6]))
+                    start_sha[:7]))
             else:
                 logger.info('  Updated checkout from {} to {}.'.format(
-                    start_sha[:6], end_sha[:6]))
+                    start_sha[:7], end_sha[:7]))
         else:
-            logger.info('  Checked out at {}.'.format(end_sha[:6]))
+            logger.info('  Checked out at {}.'.format(end_sha[:7]))
 
         return folder
 
@@ -110,14 +112,23 @@ class DepsTask:
                     )
             except IOError as e:
                 if e.errno == errno.ENOENT:
-                    logger.info("'{}' is not a valid dbt project - "
-                                "dbt_project.yml not found".format(repo))
-                    exit(1)
+                    error_string = basestring(e)
+
+                    if 'dbt_project.yml' in error_string:
+                        error_string = ("'{}' is not a valid dbt project - "
+                                        "dbt_project.yml not found"
+                                        .format(repo))
+
+                    elif 'git' in error_string:
+                        error_string = ("Git CLI is a dependency of dbt, but "
+                                        "it is not installed!")
+
+                    raise dbt.exceptions.RuntimeException(error_string)
+
                 else:
                     raise e
 
     def run(self):
-        if not os.path.exists(self.project['modules-path']):
-            os.makedirs(self.project['modules-path'])
+        dbt.clients.system.make_directory(self.project['modules-path'])
 
         self.__pull_deps_recursive(self.project['repositories'])

@@ -44,6 +44,14 @@ class ParserTest(unittest.TestCase):
             'vars': {},
         }
 
+        self.disabled_config = {
+            'enabled': False,
+            'materialized': 'view',
+            'post-hook': [],
+            'pre-hook': [],
+            'vars': {},
+        }
+
     def test__single_model(self):
         models = [{
             'name': 'model_one',
@@ -544,6 +552,130 @@ class ParserTest(unittest.TestCase):
             }
         )
 
+    def test__process_refs__packages(self):
+        graph = {
+            'macros': {},
+            'nodes': {
+                'model.snowplow.events': {
+                    'name': 'events',
+                    'resource_type': 'model',
+                    'unique_id': 'model.snowplow.events',
+                    'fqn': ['snowplow', 'events'],
+                    'empty': False,
+                    'package_name': 'snowplow',
+                    'refs': [],
+                    'depends_on': {
+                        'nodes': [],
+                        'macros': []
+                    },
+                    'config': self.disabled_config,
+                    'tags': set(),
+                    'path': 'events.sql',
+                    'root_path': get_os_path('/usr/src/app'),
+                    'raw_sql': 'does not matter'
+                },
+                'model.root.events': {
+                    'name': 'events',
+                    'resource_type': 'model',
+                    'unique_id': 'model.root.events',
+                    'fqn': ['root', 'events'],
+                    'empty': False,
+                    'package_name': 'root',
+                    'refs': [],
+                    'depends_on': {
+                        'nodes': [],
+                        'macros': []
+                    },
+                    'config': self.model_config,
+                    'tags': set(),
+                    'path': 'events.sql',
+                    'root_path': get_os_path('/usr/src/app'),
+                    'raw_sql': 'does not matter'
+                },
+                'model.root.dep': {
+                    'name': 'dep',
+                    'resource_type': 'model',
+                    'unique_id': 'model.root.dep',
+                    'fqn': ['root', 'dep'],
+                    'empty': False,
+                    'package_name': 'root',
+                    'refs': [('events',)],
+                    'depends_on': {
+                        'nodes': [],
+                        'macros': []
+                    },
+                    'config': self.model_config,
+                    'tags': set(),
+                    'path': 'multi.sql',
+                    'root_path': get_os_path('/usr/src/app'),
+                    'raw_sql': 'does not matter'
+                }
+            }
+        }
+
+        self.assertEquals(
+            dbt.parser.process_refs(graph, 'root'),
+            {
+                'macros': {},
+                'nodes': {
+                    'model.snowplow.events': {
+                        'name': 'events',
+                        'resource_type': 'model',
+                        'unique_id': 'model.snowplow.events',
+                        'fqn': ['snowplow', 'events'],
+                        'empty': False,
+                        'package_name': 'snowplow',
+                        'refs': [],
+                        'depends_on': {
+                            'nodes': [],
+                            'macros': []
+                        },
+                        'config': self.disabled_config,
+                        'tags': set(),
+                        'path': 'events.sql',
+                        'root_path': get_os_path('/usr/src/app'),
+                        'raw_sql': 'does not matter'
+                    },
+                    'model.root.events': {
+                        'name': 'events',
+                        'resource_type': 'model',
+                        'unique_id': 'model.root.events',
+                        'fqn': ['root', 'events'],
+                        'empty': False,
+                        'package_name': 'root',
+                        'refs': [],
+                        'depends_on': {
+                            'nodes': [],
+                            'macros': []
+                        },
+                        'config': self.model_config,
+                        'tags': set(),
+                        'path': 'events.sql',
+                        'root_path': get_os_path('/usr/src/app'),
+                        'raw_sql': 'does not matter'
+                    },
+                    'model.root.dep': {
+                        'name': 'dep',
+                        'resource_type': 'model',
+                        'unique_id': 'model.root.dep',
+                        'fqn': ['root', 'dep'],
+                        'empty': False,
+                        'package_name': 'root',
+                        'refs': [('events',)],
+                        'depends_on': {
+                            'nodes': ['model.root.events'],
+                            'macros': []
+                        },
+                        'config': self.model_config,
+                        'tags': set(),
+                        'path': 'multi.sql',
+                        'root_path': get_os_path('/usr/src/app'),
+                        'raw_sql': 'does not matter'
+                    }
+                }
+            }
+        )
+
     def test__in_model_config(self):
         models = [{
             'name': 'model_one',
@@ -727,6 +859,10 @@ class ParserTest(unittest.TestCase):
                     'enabled': False,
                     'views': {
                         'materialized': 'view',
+                        'multi_sort': {
+                            'enabled': True,
+                            'materialized': 'table'
+                        }
                     }
                 }
             }
@@ -741,7 +877,10 @@ class ParserTest(unittest.TestCase):
                     'enabled': False,
                     'views': {
                         'materialized': 'table',
-                        'sort': 'timestamp'
+                        'sort': 'timestamp',
+                        'multi_sort': {
+                            'sort': ['timestamp', 'id'],
+                        }
                     }
                 }
             }
@@ -783,6 +922,13 @@ class ParserTest(unittest.TestCase):
             'path': get_os_path('views/package.sql'),
             'root_path': get_os_path('/usr/src/app'),
             'raw_sql': ("select * from events"),
+        }, {
+            'name': 'multi_sort',
+            'resource_type': 'model',
+            'package_name': 'snowplow',
+            'path': get_os_path('views/multi_sort.sql'),
+            'root_path': get_os_path('/usr/src/app'),
+            'raw_sql': ("select * from events"),
         }]
 
         self.model_config.update({
@@ -810,6 +956,12 @@ class ParserTest(unittest.TestCase):
             'enabled': False,
             'materialized': 'view',
             'sort': 'timestamp',
+        })
+
+        multi_sort_config = self.model_config.copy()
+        multi_sort_config.update({
+            'materialized': 'table',
+            'sort': ['timestamp', 'id']
         })
 
         self.assertEquals(
@@ -913,6 +1065,25 @@ class ParserTest(unittest.TestCase):
                     'tags': set(),
                     'raw_sql': self.find_input_by_name(
                         models, 'package').get('raw_sql')
+                },
+                'model.snowplow.multi_sort': {
+                    'name': 'multi_sort',
+                    'resource_type': 'model',
+                    'unique_id': 'model.snowplow.multi_sort',
+                    'fqn': ['snowplow', 'views', 'multi_sort'],
+                    'empty': False,
+                    'package_name': 'snowplow',
+                    'refs': [],
+                    'depends_on': {
+                        'nodes': [],
+                        'macros': []
+                    },
+                    'path': get_os_path('views/multi_sort.sql'),
+                    'root_path': get_os_path('/usr/src/app'),
+                    'config': multi_sort_config,
+                    'tags': set(),
+                    'raw_sql': self.find_input_by_name(
+                        models, 'multi_sort').get('raw_sql')
                 }
             }
         )

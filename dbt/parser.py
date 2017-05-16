@@ -14,7 +14,7 @@ import dbt.contracts.graph.parsed
 import dbt.contracts.graph.unparsed
 import dbt.contracts.project
 
-from dbt.utils import NodeType, get_materialization, Var
+from dbt.utils import NodeType, Var
 from dbt.compat import basestring, to_string
 from dbt.logger import GLOBAL_LOGGER as logger
 
@@ -64,8 +64,47 @@ def __ref(model):
     return ref
 
 
-def process_refs(flat_graph):
+def resolve_ref(flat_graph, target_model_name, target_model_package,
+                current_project, node_package):
+
+    if target_model_package is not None:
+        return dbt.utils.find_model_by_name(
+            flat_graph,
+            target_model_name,
+            target_model_package)
+
+    target_model = None
+
+    # first pass: look for models in the current_project
+    target_model = dbt.utils.find_model_by_name(
+        flat_graph,
+        target_model_name,
+        current_project)
+
+    if target_model is not None and dbt.utils.is_enabled(target_model):
+        return target_model
+
+    # second pass: look for models in the node's package
+    target_model = dbt.utils.find_model_by_name(
+        flat_graph,
+        target_model_name,
+        node_package)
+
+    if target_model is not None and dbt.utils.is_enabled(target_model):
+        return target_model
+
+    # final pass: look for models in any package
+    # todo: exclude the packages we have already searched. overriding
+    # a package model in another package doesn't necessarily work atm
+    return dbt.utils.find_model_by_name(
+        flat_graph,
+        target_model_name,
+        None)
+
+
+def process_refs(flat_graph, current_project):
     for _, node in flat_graph.get('nodes').items():
+        target_model = None
         target_model_name = None
         target_model_package = None
 
@@ -75,10 +114,12 @@ def process_refs(flat_graph):
             elif len(ref) == 2:
                 target_model_package, target_model_name = ref
 
-            target_model = dbt.utils.find_model_by_name(
+            target_model = resolve_ref(
                 flat_graph,
                 target_model_name,
-                target_model_package)
+                target_model_package,
+                current_project,
+                node.get('package_name'))
 
             if target_model is None:
                 dbt.exceptions.ref_target_not_found(
@@ -86,9 +127,12 @@ def process_refs(flat_graph):
                     target_model_name,
                     target_model_package)
 
-            if (dbt.utils.is_enabled(node) and
-                    not dbt.utils.is_enabled(target_model)):
-                dbt.exceptions.ref_disabled_dependency(node, target_model)
+            if (dbt.utils.is_enabled(node) and not
+                    dbt.utils.is_enabled(target_model)):
+                if dbt.utils.is_type(node, NodeType.Model):
+                    dbt.exceptions.ref_disabled_dependency(node, target_model)
+                else:
+                    node.get('config', {})['enabled'] = False
 
             target_model_id = target_model.get('unique_id')
 
@@ -270,6 +314,8 @@ def load_and_parse_sql(package_name, root_project, all_projects, root_dir,
         if resource_type == NodeType.Test:
             path = dbt.utils.get_pseudo_test_path(
                 name, file_match.get('relative_path'), 'data_test')
+        elif resource_type == NodeType.Analysis:
+            path = os.path.join('analysis', file_match.get('relative_path'))
         else:
             path = file_match.get('relative_path')
 
@@ -283,6 +329,64 @@ def load_and_parse_sql(package_name, root_project, all_projects, root_dir,
         })
 
     return parse_sql_nodes(result, root_project, all_projects, tags)
+
+
+def get_hooks_from_project(project_cfg, hook_type):
+    hooks = project_cfg.get(hook_type, [])
+
+    if type(hooks) not in (list, tuple):
+        hooks = [hooks]
+
+    return hooks
+
+
+def get_hooks(all_projects, hook_type):
+    project_hooks = {}
+
+    for project_name, project in all_projects.items():
+        hooks = get_hooks_from_project(project, hook_type)
+
+        if len(hooks) > 0:
+            project_hooks[project_name] = ";\n".join(hooks)
+
+    return project_hooks
+
+
+def load_and_parse_run_hook_type(root_project, all_projects, hook_type):
+
+    if dbt.flags.STRICT_MODE:
+        dbt.contracts.project.validate_list(all_projects)
+
+    project_hooks = get_hooks(all_projects, hook_type)
+
+    result = []
+    for project_name, hooks in project_hooks.items():
+        project = all_projects[project_name]
+
+        hook_path = dbt.utils.get_pseudo_hook_path(hook_type)
+
+        result.append({
+            'name': hook_type,
+            'root_path': "{}/dbt_project.yml".format(project_name),
+            'resource_type': NodeType.Operation,
+            'path': hook_path,
+            'package_name': project_name,
+            'raw_sql': hooks
+        })
+
+    tags = {hook_type}
+    return parse_sql_nodes(result, root_project, all_projects, tags=tags)
+
+
+def load_and_parse_run_hooks(root_project, all_projects):
+    hook_nodes = {}
+    for hook_type in dbt.utils.RunHookType.Both:
+        project_hooks = load_and_parse_run_hook_type(root_project,
+                                                     all_projects,
+                                                     hook_type)
+        hook_nodes.update(project_hooks)
+
+    return hook_nodes
 
 
 def load_and_parse_macros(package_name, root_project, all_projects, root_dir,

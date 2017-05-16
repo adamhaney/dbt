@@ -1,66 +1,7 @@
 from nose.plugins.attrib import attr
 from test.integration.base import DBTIntegrationTest
 
-
-RUN_START_HOOK = """
-   insert into run_hooks_014.on_run_hook (
-        "state",
-        "target.dbname",
-        "target.host",
-        "target.name",
-        "target.schema",
-        "target.type",
-        "target.user",
-        "target.pass",
-        "target.port",
-        "target.threads",
-        "run_started_at",
-        "invocation_id"
-   ) VALUES (
-    'start',
-    '{{ target.dbname }}',
-    '{{ target.host }}',
-    '{{ target.name }}',
-    '{{ target.schema }}',
-    '{{ target.type }}',
-    '{{ target.user }}',
-    '{{ target.pass }}',
-    {{ target.port }},
-    {{ target.threads }},
-    '{{ run_started_at }}',
-    '{{ invocation_id }}'
-   )
-"""
-
-RUN_END_HOOK = """
-   insert into run_hooks_014.on_run_hook (
-        "state",
-        "target.dbname",
-        "target.host",
-        "target.name",
-        "target.schema",
-        "target.type",
-        "target.user",
-        "target.pass",
-        "target.port",
-        "target.threads",
-        "run_started_at",
-        "invocation_id"
-   ) VALUES (
-    'end',
-    '{{ target.dbname }}',
-    '{{ target.host }}',
-    '{{ target.name }}',
-    '{{ target.schema }}',
-    '{{ target.type }}',
-    '{{ target.user }}',
-    '{{ target.pass }}',
-    {{ target.port }},
-    {{ target.threads }},
-    '{{ run_started_at }}',
-    '{{ invocation_id }}'
-   )
-"""
+import os.path
 
 class TestPrePostRunHooks(DBTIntegrationTest):
 
@@ -91,8 +32,10 @@ class TestPrePostRunHooks(DBTIntegrationTest):
     @property
     def project_config(self):
         return {
-            "on-run-start": RUN_START_HOOK,
-            "on-run-end":   RUN_END_HOOK
+            'macro-paths': ['test/integration/014_hook_tests/macros'],
+
+            "on-run-start": "{{ custom_run_hook('start', target, run_started_at, invocation_id) }}",
+            "on-run-end": "{{ custom_run_hook('end', target, run_started_at, invocation_id) }}",
         }
 
     @property
@@ -101,7 +44,7 @@ class TestPrePostRunHooks(DBTIntegrationTest):
 
     def get_ctx_vars(self, state):
         field_list = ", ".join(['"{}"'.format(f) for f in self.fields])
-        query = "select {field_list} from {schema}.on_run_hook where state = '{state}'".format(field_list=field_list, schema=self.schema, state=state)
+        query = "select {field_list} from {schema}.on_run_hook where state = '{state}'".format(field_list=field_list, schema=self.unique_schema(), state=state)
 
         vals = self.run_sql(query, fetch='all')
         self.assertFalse(len(vals) == 0, 'nothing inserted into on_run_hook table')
@@ -118,7 +61,7 @@ class TestPrePostRunHooks(DBTIntegrationTest):
         self.assertEqual(ctx['target.host'], 'database')
         self.assertEqual(ctx['target.name'], 'default2')
         self.assertEqual(ctx['target.port'], 5432)
-        self.assertEqual(ctx['target.schema'], self.schema)
+        self.assertEqual(ctx['target.schema'], self.unique_schema())
         self.assertEqual(ctx['target.threads'], 4)
         self.assertEqual(ctx['target.type'], 'postgres')
         self.assertEqual(ctx['target.user'], 'root')

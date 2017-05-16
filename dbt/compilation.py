@@ -1,3 +1,4 @@
+import itertools
 import os
 from collections import OrderedDict, defaultdict
 import sqlparse
@@ -6,19 +7,18 @@ import dbt.project
 import dbt.utils
 import dbt.include
 import dbt.wrapper
+import dbt.tracking
 
-from dbt.model import Model
-from dbt.utils import This, Var, is_enabled, get_materialization, NodeType, \
-    is_type
+from dbt.utils import This, Var, get_materialization, NodeType, is_type
 
 from dbt.linker import Linker
-from dbt.runtime import RuntimeContext
 
 import dbt.compat
 import dbt.contracts.graph.compiled
 import dbt.contracts.project
 import dbt.exceptions
 import dbt.flags
+import dbt.loader
 import dbt.parser
 
 from dbt.adapters.factory import get_adapter
@@ -38,6 +38,7 @@ def print_compile_stats(stats):
         NodeType.Archive: 'archives',
         NodeType.Analysis: 'analyses',
         NodeType.Macro: 'macros',
+        NodeType.Operation: 'operations',
     }
 
     results = {
@@ -46,6 +47,7 @@ def print_compile_stats(stats):
         NodeType.Archive: 0,
         NodeType.Analysis: 0,
         NodeType.Macro: 0,
+        NodeType.Operation: 0,
     }
 
     results.update(stats)
@@ -53,7 +55,7 @@ def print_compile_stats(stats):
     stat_line = ", ".join(
         ["{} {}".format(ct, names.get(t)) for t, ct in results.items()])
 
-    logger.info("Compiled {}".format(stat_line))
+    logger.info("Found {}".format(stat_line))
 
 
 def prepend_ctes(model, flat_graph):
@@ -73,7 +75,7 @@ def recursively_prepend_ctes(model, flat_graph):
     if model.get('all_ctes_injected') is True:
         return (model, model.get('extra_ctes').keys(), flat_graph)
 
-    for cte_id in model.get('extra_ctes').keys():
+    for cte_id in model.get('extra_ctes', {}).keys():
         cte_to_add = flat_graph.get('nodes').get(cte_id)
         cte_to_add, new_prepend_ctes, flat_graph = recursively_prepend_ctes(
             cte_to_add, flat_graph)
@@ -153,18 +155,13 @@ class Compiler(object):
         self.parsed_models = None
 
     def initialize(self):
-        if not os.path.exists(self.project['target-path']):
-            os.makedirs(self.project['target-path'])
-
-        if not os.path.exists(self.project['modules-path']):
-            os.makedirs(self.project['modules-path'])
+        dbt.clients.system.make_directory(self.project['target-path'])
+        dbt.clients.system.make_directory(self.project['modules-path'])
 
     def __write(self, build_filepath, payload):
         target_path = os.path.join(self.project['target-path'], build_filepath)
 
-        if not os.path.exists(os.path.dirname(target_path)):
-            os.makedirs(os.path.dirname(target_path))
-
+        dbt.clients.system.make_directory(os.path.dirname(target_path))
         dbt.compat.write_file(target_path, payload)
 
         return target_path
@@ -175,7 +172,7 @@ class Compiler(object):
 
         return do_config
 
-    def __ref(self, ctx, model, all_models):
+    def __ref(self, ctx, model, flat_graph, current_project):
         schema = ctx.get('env', {}).get('schema')
 
         def do_ref(*args):
@@ -189,10 +186,12 @@ class Compiler(object):
             else:
                 dbt.exceptions.ref_invalid_args(model, args)
 
-            target_model = dbt.utils.find_model_by_name(
-                all_models,
+            target_model = dbt.parser.resolve_ref(
+                flat_graph,
                 target_model_name,
-                target_model_package)
+                target_model_package,
+                current_project,
+                model.get('package_name'))
 
             if target_model is None:
                 dbt.exceptions.ref_target_not_found(
@@ -223,7 +222,8 @@ class Compiler(object):
         wrapper = dbt.wrapper.DatabaseWrapper(model, adapter, profile)
 
         # built-ins
-        context['ref'] = self.__ref(context, model, flat_graph)
+        context['ref'] = self.__ref(context, model, flat_graph,
+                                    self.project.cfg.get('name'))
         context['config'] = self.__model_config(model)
         context['this'] = This(
             context['env']['schema'],
@@ -237,8 +237,8 @@ class Compiler(object):
 
         context.update(wrapper.get_context_functions())
 
-        context['run_started_at'] = '{{ run_started_at }}'
-        context['invocation_id'] = '{{ invocation_id }}'
+        context['run_started_at'] = dbt.tracking.active_user.run_started_at
+        context['invocation_id'] = dbt.tracking.active_user.invocation_id
         context['sql_now'] = adapter.date_function()
 
         for unique_id, macro in flat_graph.get('macros').items():
@@ -282,7 +282,8 @@ class Compiler(object):
         injected_node, _ = prepend_ctes(compiled_node, flat_graph)
 
         if compiled_node.get('resource_type') in [NodeType.Test,
-                                                  NodeType.Analysis]:
+                                                  NodeType.Analysis,
+                                                  NodeType.Operation]:
             # data tests get wrapped in count(*)
             # TODO : move this somewhere more reasonable
             if 'data' in injected_node['tags'] and \
@@ -312,14 +313,16 @@ class Compiler(object):
                 context,
                 flat_graph)
 
+            injected_node['wrapped_sql'] = wrapped_stmt
+
+        if 'wrapped_sql' in injected_node:
             build_path = os.path.join('build',
                                       injected_node.get('package_name'),
                                       injected_node.get('path'))
 
             written_path = self.__write(build_path,
-                                        wrapped_stmt)
+                                        injected_node['wrapped_sql'])
 
-            injected_node['wrapped_sql'] = wrapped_stmt
             injected_node['build_path'] = written_path
 
         return injected_node
@@ -350,7 +353,7 @@ class Compiler(object):
     def link_graph(self, linker, flat_graph):
         linked_graph = {
             'nodes': {},
-            'macros': flat_graph.get('macros'),
+            'macros': flat_graph.get('macros')
         }
 
         for name, node in flat_graph.get('nodes').items():
@@ -378,125 +381,28 @@ class Compiler(object):
 
         return all_projects
 
-    def get_parsed_macros(self, root_project, all_projects):
-        parsed_macros = {}
-
-        for name, project in all_projects.items():
-            parsed_macros.update(
-                dbt.parser.load_and_parse_macros(
-                    package_name=name,
-                    root_project=root_project,
-                    all_projects=all_projects,
-                    root_dir=project.get('project-root'),
-                    relative_dirs=project.get('macro-paths', []),
-                    resource_type=NodeType.Macro))
-
-        return parsed_macros
-
-    def get_parsed_models(self, root_project, all_projects):
-        parsed_models = {}
-
-        for name, project in all_projects.items():
-            parsed_models.update(
-                dbt.parser.load_and_parse_sql(
-                    package_name=name,
-                    root_project=root_project,
-                    all_projects=all_projects,
-                    root_dir=project.get('project-root'),
-                    relative_dirs=project.get('source-paths', []),
-                    resource_type=NodeType.Model))
-
-        return parsed_models
-
-    def get_parsed_analyses(self, root_project, all_projects):
-        parsed_models = {}
-
-        for name, project in all_projects.items():
-            parsed_models.update(
-                dbt.parser.load_and_parse_sql(
-                    package_name=name,
-                    root_project=root_project,
-                    all_projects=all_projects,
-                    root_dir=project.get('project-root'),
-                    relative_dirs=project.get('analysis-paths', []),
-                    resource_type=NodeType.Analysis))
-
-        return parsed_models
-
-    def get_parsed_data_tests(self, root_project, all_projects):
-        parsed_tests = {}
-
-        for name, project in all_projects.items():
-            parsed_tests.update(
-                dbt.parser.load_and_parse_sql(
-                    package_name=name,
-                    root_project=root_project,
-                    all_projects=all_projects,
-                    root_dir=project.get('project-root'),
-                    relative_dirs=project.get('test-paths', []),
-                    resource_type=NodeType.Test,
-                    tags={'data'}))
-
-        return parsed_tests
-
-    def get_parsed_schema_tests(self, root_project, all_projects):
-        parsed_tests = {}
-
-        for name, project in all_projects.items():
-            parsed_tests.update(
-                dbt.parser.load_and_parse_yml(
-                    package_name=name,
-                    root_project=root_project,
-                    all_projects=all_projects,
-                    root_dir=project.get('project-root'),
-                    relative_dirs=project.get('source-paths', [])))
-
-        return parsed_tests
-
-    def load_all_macros(self, root_project, all_projects):
-        return self.get_parsed_macros(root_project, all_projects)
-
-    def load_all_nodes(self, root_project, all_projects):
-        all_nodes = {}
-
-        all_nodes.update(self.get_parsed_models(root_project, all_projects))
-        all_nodes.update(self.get_parsed_analyses(root_project, all_projects))
-        all_nodes.update(
-            self.get_parsed_data_tests(root_project, all_projects))
-        all_nodes.update(
-            self.get_parsed_schema_tests(root_project, all_projects))
-        all_nodes.update(
-            dbt.parser.parse_archives_from_projects(root_project,
-                                                    all_projects))
-
-        return all_nodes
-
     def compile(self):
         linker = Linker()
 
         root_project = self.project.cfg
         all_projects = self.get_all_projects()
 
-        all_macros = self.load_all_macros(root_project, all_projects)
-        all_nodes = self.load_all_nodes(root_project, all_projects)
+        flat_graph = dbt.loader.GraphLoader.load_all(
+            root_project, all_projects)
 
-        flat_graph = {
-            'nodes': all_nodes,
-            'macros': all_macros
-        }
-
-        flat_graph = dbt.parser.process_refs(flat_graph)
+        flat_graph = dbt.parser.process_refs(flat_graph,
+                                             root_project.get('name'))
 
         linked_graph = self.link_graph(linker, flat_graph)
 
         stats = defaultdict(int)
 
-        for node_name, node in linked_graph.get('nodes').items():
+        for node_name, node in itertools.chain(
+                linked_graph.get('nodes').items(),
+                linked_graph.get('macros').items()):
             stats[node.get('resource_type')] += 1
 
-        for node_name, node in linked_graph.get('macros').items():
-            stats[node.get('resource_type')] += 1
-
+        self.write_graph_file(linker)
         print_compile_stats(stats)
 
         return linked_graph, linker
